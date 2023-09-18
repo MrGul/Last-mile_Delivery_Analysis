@@ -1,0 +1,277 @@
+import pandas as pd
+import folium
+import itertools
+from math import radians, sin, cos, sqrt, atan2
+from geojson import Feature, Point, FeatureCollection
+
+def calculate_distance(location1, location2):
+    lat1, lon1 = location1
+    lat2, lon2 = location2
+    earth_radius = 6371  # Radius of the Earth in kilometers
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) * sin(dlat / 2) + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) * sin(dlon / 2)
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = earth_radius * c
+    return distance
+
+def is_in_restricted_zone(location, restricted_areas):
+    for restricted_area in restricted_areas:
+        center = restricted_area['center']
+        radius_km = restricted_area['radius_km']
+        distance = calculate_distance(center, location)
+        if distance <= radius_km:
+            return True
+    return False
+
+def flying_sidekick_tsp(customer_locations, customer_weights, truck_speed, drone_speed,
+                        drone_weight_limit, battery_capacity, restricted_areas, customer_permutations,
+                        customer_delivery_time, battery_swap_time):
+    best_solution = None
+    best_distance = float('inf')
+    best_drone_distance = float('-inf')
+    min_truck_usage = float('inf')
+    best_total_time = float('inf')
+
+    for permutation in customer_permutations:
+        solution = []
+        current_location = (11.057234, 77.078301)  # Start at the depot
+        drone_location = None  # Track the drone's location separately
+
+        remaining_capacity = 1
+        remaining_drone_weight = drone_weight_limit
+        remaining_battery = battery_capacity
+        total_time = 0  # Track the total time taken for the solution
+
+        visited_customers_truck = set()  # Track visited customers by the truck
+        visited_customers_drone = set()  # Track visited customers by the drone
+        total_drone_distance = 0
+        truck_usage = 0
+
+        for customer in permutation:
+            customer_location = customer_locations[customer]
+
+            if customer in visited_customers_truck or customer in visited_customers_drone:
+                # Skip already visited customers
+                continue
+
+            if drone_location is None:
+                # Start drone delivery from truck's location
+                drone_location = current_location
+
+            if is_in_restricted_zone(customer_location, restricted_areas):
+                # Deliver by truck for customers in restricted zones
+                travel_time_to_customer = calculate_distance(current_location, customer_location) / truck_speed * 60
+                total_time += travel_time_to_customer + customer_delivery_time  # Add time for truck travel and delivery
+                solution.append((customer, "Truck", customer_location, travel_time_to_customer))
+
+                current_location = customer_location
+                visited_customers_truck.add(customer)
+                truck_usage += 1
+            else:
+                # Check if the delivery can be made by a drone
+                if (
+                    customer_weights[customer] <= remaining_drone_weight
+                    and remaining_battery >= calculate_distance(drone_location, customer_location) / drone_speed * 60
+                ):
+                    # If the package weight is within the drone's capacity and there is enough remaining battery, deliver by drone
+                    travel_time_to_customer = calculate_distance(drone_location, customer_location) / drone_speed * 60
+                    total_time += travel_time_to_customer + customer_delivery_time  # Add time for drone travel and delivery
+                    solution.append((customer, "Drone", customer_location, travel_time_to_customer))
+
+                    current_location = customer_location
+                    remaining_drone_weight -= customer_weights[customer]
+                    remaining_battery -= calculate_distance(drone_location, customer_location) / drone_speed * 60
+                    visited_customers_drone.add(customer)
+                    total_drone_distance += calculate_distance(drone_location, customer_location)
+                    if remaining_drone_weight == 0:
+                        # Drone capacity reached, return to the truck for battery swap and reload
+                        distance_to_truck = calculate_distance(drone_location, current_location)
+                        travel_time_to_truck = distance_to_truck / drone_speed * 60
+                        total_time += travel_time_to_truck + battery_swap_time  # Add time for drone return and battery swap
+                        solution.append((-1, "Truck", current_location, travel_time_to_truck))
+
+                        remaining_battery = battery_capacity  # Fully charge the drone's battery
+                        drone_location = None  # Drone returns to the truck
+                        remaining_drone_weight = drone_weight_limit
+
+                else:
+                    # Deliver by truck if weight/battery constraints are not met
+                    travel_time_to_customer = calculate_distance(current_location, customer_location) / truck_speed * 60
+                    total_time += travel_time_to_customer + customer_delivery_time  # Add time for truck travel and delivery
+                    solution.append((customer, "Truck", customer_location, travel_time_to_customer))
+
+                    current_location = customer_location
+                    visited_customers_truck.add(customer)
+                    truck_usage += 1
+
+        # Calculate the total distance for the solution
+        total_distance = sum(calculate_distance(solution[i][2], solution[i + 1][2]) for i in range(len(solution) - 1))
+
+        # Update the best solution if the current solution is better
+        if total_distance < best_distance:
+            best_distance = total_distance
+            best_solution = solution
+            best_drone_distance = total_drone_distance
+            min_truck_usage = truck_usage
+            best_total_time = total_time
+
+    return best_solution, best_distance, best_drone_distance, min_truck_usage, best_total_time
+
+# Read data from the Excel file
+data = pd.read_excel('data.xlsx', sheet_name=None)
+
+# Extract customer data from the 'Customer' sheet
+customer_data = data['Customer']
+customer_locations = [(lat, lon) for lat, lon in zip(customer_data['latitude'], customer_data['longitude'])]
+customer_weights = customer_data['weight'].tolist()
+
+# Extract truck and drone parameters from the 'Parameter' sheet
+parameter_data = data['Parameter']
+truck_speed = parameter_data.loc[parameter_data['parameter_name'] == 'truck_speed', 'value'].iloc[0]
+drone_speed = parameter_data.loc[parameter_data['parameter_name'] == 'drone_speed', 'value'].iloc[0]
+drone_weight_limit = parameter_data.loc[parameter_data['parameter_name'] == 'drone_weight_limit', 'value'].iloc[0]
+battery_capacity = parameter_data.loc[parameter_data['parameter_name'] == 'battery_capacity', 'value'].iloc[0]
+
+# Extract restricted areas from the 'Restricted Area' sheet
+restricted_area_data = data.get('Restricted Area')
+if restricted_area_data is not None:
+    restricted_areas = []
+    for _, row in restricted_area_data.iterrows():
+        restricted_area = {
+            'center': (row['latitude'], row['longitude']),
+            'radius_km': row['radius_km']
+        }
+        restricted_areas.append(restricted_area)
+else:
+    restricted_areas = []  # If there are no restricted areas in the Excel file
+
+# Generate all possible permutations of customer visits
+customer_permutations = list(itertools.permutations(range(len(customer_locations))))
+
+# Define battery swap time and customer delivery time in minutes
+battery_swap_time = 5
+customer_delivery_time = 5
+
+# Call the flying_sidekick_tsp function with the extracted data
+best_solution, best_distance, best_drone_distance, min_truck_usage, best_total_time = flying_sidekick_tsp(
+    customer_locations,
+    customer_weights,
+    truck_speed,
+    drone_speed,
+    drone_weight_limit,
+    battery_capacity,
+    restricted_areas,
+    customer_permutations,
+    customer_delivery_time,
+    battery_swap_time
+)
+
+# Create a FeatureCollection to hold all the customer points
+features = []
+for customer, mode, location, travel_time in best_solution:
+    if customer == -1:
+        continue  # Skip battery swap locations
+    else:
+        point = Point((location[1], location[0]))
+        properties = {
+            'customer': customer + 1,
+            'location': location,
+            'weight': customer_weights[customer],
+            'mode': mode,  # Added mode to properties
+            'travel_time': travel_time  # Added travel time to properties
+        }
+        features.append(Feature(geometry=point, properties=properties))
+
+feature_collection = FeatureCollection(features)
+
+# Create a Folium map centered around the depot
+m = folium.Map(location=(11.057234, 77.078301), zoom_start=12)
+
+# Add the depot as a marker
+folium.Marker(
+    location=(11.057234, 77.078301),
+    icon=folium.Icon(icon="home", color="red"),
+).add_to(m)
+
+# Add the customer points to the map as markers with popup information and mode-based icons
+for feature in feature_collection['features']:
+    customer_id = feature['properties']['customer']
+    weight = feature['properties']['weight']
+    location = feature['properties']['location']
+    mode = feature['properties']['mode']  # Get the delivery mode
+
+    # Choose the icon based on the mode
+    icon_color = "blue" if mode == "Drone" else "red"
+    icon = folium.Icon(icon="cloud", color=icon_color) if mode == "Drone" else folium.Icon(icon="truck", color=icon_color)
+
+    popup_text = f"Customer {customer_id}<br>Weight: {weight} kg<br>Delivery Mode: {mode}"
+    folium.Marker(
+        location=[location[0], location[1]],
+        popup=popup_text,
+        icon=icon,  # Use the mode-based icon
+    ).add_to(m)
+
+# Add the delivery routes as polylines on the map with popup directions
+for i in range(len(best_solution) - 1):
+    current_location = best_solution[i][2]
+    next_location = best_solution[i + 1][2]
+
+    # Calculate the directions
+    directions = f"From Customer {best_solution[i][0] + 1} to Customer {best_solution[i + 1][0] + 1}"
+    if best_solution[i][0] == -1:
+        directions = f"From Depot to Customer {best_solution[i + 1][0] + 1}"
+    elif best_solution[i + 1][0] == -1:
+        directions = f"From Customer {best_solution[i][0] + 1} to Depot"
+
+    # Create the popup for the polyline with directions
+    popup_text = f"<b>Directions:</b><br>{directions}"
+
+    folium.PolyLine([current_location, next_location], color="blue", weight=2.5, opacity=1, popup=popup_text).add_to(m)
+
+# Add the blue line from depot to the first customer and from the last customer back to the depot
+first_customer_location = best_solution[0][2]
+last_customer_location = best_solution[-1][2]
+
+folium.PolyLine([(11.057234, 77.078301), first_customer_location], color="blue", weight=2.5, opacity=1).add_to(m)
+folium.PolyLine([last_customer_location, (11.057234, 77.078301)], color="blue", weight=2.5, opacity=1).add_to(m)
+
+# Mark restricted areas on the map
+for restricted_area in restricted_areas:
+    center = restricted_area['center']
+    radius_km = restricted_area['radius_km']
+    folium.Circle(
+        location=center,
+        radius=radius_km * 1000,
+        color='red',
+        fill=True,
+        fill_color='red',
+        fill_opacity=0.2,
+    ).add_to(m)
+
+# Display the map
+m.save("FSTSP1.2.html")
+
+# Print the best solution and the total time taken
+print("Best Distance (km):", best_distance)
+print("Best Drone Distance (km):", best_drone_distance)
+print("Min Truck Usage:", min_truck_usage)
+print("Total Time Taken (minutes):", best_total_time)
+
+# Print the best solution
+print("Best Solution:")
+for i, (customer, mode, location, travel_time) in enumerate(best_solution):
+    if customer == -1:
+        continue  # Skip battery swap locations in the output
+    else:
+        if i < len(best_solution) - 1:
+            next_location = best_solution[i + 1][2]
+        else:
+            next_location = (11.057234, 77.078301)  # Depot
+
+        print(
+            f"Deliver to Customer {customer + 1} ({customer_locations[customer]}) by {mode} to {next_location} - Travel Time: {travel_time:.2f} minutes"
+        )
+print("Drone Weight Limit:", drone_weight_limit)
+print("Battery Capacity (minutes):", battery_capacity)
+print("drone speed:", drone_speed)
