@@ -1,0 +1,149 @@
+import pandas as pd
+import folium
+from math import radians, sin, cos, sqrt, atan2
+import itertools
+
+def calculate_distance(location1, location2):
+    lat1, lon1 = location1
+    lat2, lon2 = location2
+    earth_radius = 6371  # Radius of the Earth in kilometers
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) * sin(dlat / 2) + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) * sin(dlon / 2)
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = earth_radius * c
+    return distance
+
+def is_in_restricted_zone(location, restricted_areas):
+    for restricted_area in restricted_areas:
+        center = restricted_area['center']
+        radius_km = restricted_area['radius_km']
+        distance = calculate_distance(center, location)
+        if distance <= radius_km:
+            return True
+    return False
+
+def truck_tsp(customer_locations, customer_weights, truck_speed, customer_permutations):
+    best_solution = None
+    best_distance = float('inf')
+    min_truck_usage = float('inf')
+    min_time_taken = float('inf')
+
+    for permutation in customer_permutations:
+        solution = []
+        current_location = customer_locations[0]  # Start at the depot (use the first customer location as the depot)
+
+        for customer in permutation:
+            customer_location = customer_locations[customer]
+
+            if customer in solution:
+                continue
+
+            solution.append(customer)
+            current_location = customer_location
+
+        solution.append(-1)  # Use -1 to represent the depot
+        
+        total_distance = 0
+        total_time_taken = 0
+
+        for i in range(len(solution) - 1):
+            distance = calculate_distance(customer_locations[solution[i]], customer_locations[solution[i + 1]])
+            time_taken = distance / truck_speed * 60  # Calculate time taken using truck speed (in minutes)
+            total_distance += distance
+            total_time_taken += time_taken
+
+        if total_distance < best_distance:
+            best_distance = total_distance
+            best_solution = solution
+            min_truck_usage = len(set(solution)) - 1  # Count unique customers visited (excluding the depot)
+            min_time_taken = total_time_taken  # Update min_time_taken
+
+    return best_solution, best_distance, min_truck_usage, min_time_taken
+
+if __name__ == "__main__":
+    # Read data from the Excel file
+    data = pd.read_excel('data.xlsx', sheet_name=None)
+
+    # Extract customer data from the 'Customer' sheet
+    customer_data = data['Customer']
+    customer_locations = [(lat, lon) for lat, lon in zip(customer_data['latitude'], customer_data['longitude'])]
+    customer_weights = customer_data['weight'].tolist()
+
+    # Extract truck parameters from the 'Parameter' sheet
+    parameter_data = data['Parameter']
+    truck_speed = parameter_data.loc[parameter_data['parameter_name'] == 'truck_speed', 'value'].iloc[0]
+
+    # Generate all possible permutations of customer visits
+    customer_permutations = list(itertools.permutations(range(len(customer_locations))))
+
+    # Call the truck_tsp function with the extracted data
+    best_solution, best_distance, min_truck_usage, min_time_taken = truck_tsp(
+        customer_locations,
+        customer_weights,
+        truck_speed,
+        customer_permutations
+    )
+
+    # Print the best solution for trucks-only
+    print("Best Distance (km) with Trucks Only:", best_distance)
+    print("Min Truck Usage:", min_truck_usage)
+    print("Min Time Taken (minutes):", min_time_taken)  # Print min_time_taken
+    print("Best Solution (Trucks Only):")
+    for customer in best_solution:
+        if customer == -1:
+            continue  # Skip the depot in the output
+        print("Deliver to Customer", customer + 1, "at", customer_locations[customer])
+
+    # Create a Folium map centered around the depot
+    m = folium.Map(location=(11.057234, 77.078301), zoom_start=12)
+
+    # Add the depot as a marker
+    folium.Marker(
+        location=(11.057234, 77.078301),
+        icon=folium.Icon(icon="home", color="red"),
+    ).add_to(m)
+
+    # Add the customer locations as markers with pop-ups showing customer number and weight
+    for i, location in enumerate(customer_locations):
+        customer_number = i + 1
+        customer_weight = customer_weights[i]
+        popup_text = f"Customer {customer_number}<br>Weight: {customer_weight} kg"
+        folium.Marker(
+            location=location,
+            popup=popup_text,
+            icon=folium.Icon(icon="circle", color="red", prefix='fa'),  # Solid red circle
+        ).add_to(m)
+
+    # Add the delivery routes as polylines on the map with popup directions and delivery times
+    total_time = 0
+
+    # Add the polyline for routing from the depot to the first customer
+    first_customer_location = customer_locations[best_solution[0]]
+    folium.PolyLine([(11.057234, 77.078301), first_customer_location], color="blue", weight=2.5, opacity=1).add_to(m)
+
+    for i in range(len(best_solution) - 1):
+        customer = best_solution[i]
+        next_customer = best_solution[i + 1]
+        current_location = customer_locations[customer]
+        next_location = customer_locations[next_customer]
+
+        distance = calculate_distance(current_location, next_location)
+        time_taken = distance / truck_speed * 60  # Calculate time taken using truck speed (in minutes)
+        total_time += time_taken
+
+        # Calculate the directions
+        directions = f"From Customer {customer + 1} to Customer {next_customer + 1}"
+
+        # Create the popup for the polyline with directions and delivery time
+        popup_text = f"<b>Directions:</b><br>{directions}<br>Delivery Time: {time_taken:.2f} minutes"
+
+        folium.PolyLine([current_location, next_location], color="blue", weight=2.5, opacity=1, popup=popup_text).add_to(m)
+
+    # Add the polyline for returning to the depot from the last customer
+    last_customer_location = customer_locations[best_solution[-2]]
+    folium.PolyLine([last_customer_location, (11.057234, 77.078301)], color="blue", weight=2.5, opacity=1).add_to(m)
+
+    # Save the map to an HTML file
+    m.save("TSP1.html")
+    print("truck speed:", truck_speed)
